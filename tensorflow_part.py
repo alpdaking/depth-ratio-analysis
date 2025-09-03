@@ -134,7 +134,7 @@ def main():
         
     print(f"Using device: {device_name}")  
 
-    experiment_name = 'short_improvements_pat20'
+    experiment_name = 'FeatureEngineering'
     print("Starting experiment: " + experiment_name)
 
     exp_root = os.path.join("experiments", experiment_name)
@@ -170,33 +170,99 @@ def main():
 
     df['midPrice'] = (df['Level 1 Bid Price'] + df['Level 1 Ask Price']) / 2
     
-    feature_columns = [
+    # --- Short names for L1 book fields
+    bid1 = 'Level 1 Bid Price'
+    ask1 = 'Level 1 Ask Price'
+    bv1  = 'Level 1 Bid Volume'
+    av1  = 'Level 1 Ask Volume'
+
+    # --- Time of day (cyclical, minutes since midnight)
+    t_min = df['DateTime'].dt.hour * 60 + df['DateTime'].dt.minute
+    angle = 2*np.pi * t_min / 1440.0
+    df['minute_of_day_sin'] = np.sin(angle)
+    df['minute_of_day_cos'] = np.cos(angle)
+
+    # --- Returns, momentum, moving average, volatility (all past-only)
+    df['ret1'] = np.log(df['midPrice']).diff().fillna(0.0)              # 1-step log return
+    df['ret5'] = df['ret1'].rolling(5).sum().fillna(0.0)                # short momentum
+    df['mom_10'] = (np.log(df['midPrice']) - np.log(df['midPrice'].shift(10))).fillna(0.0)
+    df['sma20_ratio'] = (df['midPrice'].rolling(20).mean() / (df['midPrice'] + 1e-12) - 1.0).fillna(0.0)
+    df['rv_30'] = (df['ret1']**2).rolling(30).sum().fillna(0.0)         # realized variance proxy
+
+    # --- Microprice & deviation vs mid (bps)
+    df['microprice'] = (df[ask1]*df[bv1] + df[bid1]*df[av1]) / (df[bv1] + df[av1] + 1e-12)
+    df['micro_minus_mid_bps'] = (df['microprice'] / (df['midPrice'] + 1e-12) - 1.0) * 1e4
+
+    # --- Order Flow Imbalance (top & L5) using quote/size deltas
+    def ofi_level(level: int):
+        dbp = df[f'Level {level} Bid Price'].diff()
+        dap = df[f'Level {level} Ask Price'].diff()
+        dbv = df[f'Level {level} Bid Volume'].diff().fillna(0.0)
+        dav = df[f'Level {level} Ask Volume'].diff().fillna(0.0)
+        # Added bid volume when bid price stays/raises; removed ask volume when ask price stays/lowers
+        return dbv.where(dbp >= 0, 0.0).fillna(0.0) - dav.where(dap <= 0, 0.0).fillna(0.0)
+
+    df['OFI1']  = ofi_level(1)
+    df['OFI_L5'] = sum(ofi_level(i) for i in range(1, 6))
+
+    # --- Order Book Imbalance (top and cumulative L5)
+    sum_bids = sum(df[f'Level {i} Bid Volume'] for i in range(1, 6))
+    sum_asks = sum(df[f'Level {i} Ask Volume'] for i in range(1, 6))
+    df['q_imb_top'] = df[bv1] / (df[bv1] + df[av1] + 1e-12)
+    df['q_imb_L5']  = sum_bids / (sum_bids + sum_asks + 1e-12)
+
+    # --- Liquidity: spread (bps), top-depth share, and simple book slopes
+    df['spread'] = df[ask1] - df[bid1]
+    df['rel_spread_bps'] = (df['spread'] / (df['midPrice'] + 1e-12)) * 1e4
+
+    total_depth_L5 = sum(df[f'Level {i} Bid Volume'] + df[f'Level {i} Ask Volume'] for i in range(1, 6))
+    df['top_depth_share'] = (df[bv1] + df[av1]) / (total_depth_L5 + 1e-12)
+
+    df['book_slope_bid'] = (df['Level 5 Bid Price'] - df['Level 1 Bid Price']) / 4.0
+    df['book_slope_ask'] = (df['Level 1 Ask Price'] - df['Level 5 Ask Price']) / 4.0
+
+    # --- Clean engineered columns: replace inf -> NaN -> 0 (so your later forward-fill isn't stuck at start)
+    engineered_cols = [
+        'minute_of_day_sin','minute_of_day_cos',
+        'ret1','ret5','mom_10','sma20_ratio','rv_30',
+        'microprice','micro_minus_mid_bps',
+        'OFI1','OFI_L5',
+        'q_imb_top','q_imb_L5',
+        'spread','rel_spread_bps',
+        'top_depth_share','book_slope_bid','book_slope_ask'
+    ]
+    df[engineered_cols] = df[engineered_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # --- Update feature list: keep midPrice LAST (required by midprice_mse)
+    raw_cols = [
         'Depth Ratio',
-        'Last Price', 
+        'Last Price',
         'Total Bid Volume',
         ' Total Ask Volume',
-        'Level 1 Bid Price',
-        'Level 1 Bid Volume',
-        'Level 1 Ask Price', 
-        'Level 1 Ask Volume',
-        'Level 2 Bid Price',
-        'Level 2 Bid Volume',
-        'Level 2 Ask Price', 
-        'Level 2 Ask Volume',
-        'Level 3 Bid Price',
-        'Level 3 Bid Volume',
-        'Level 3 Ask Price', 
-        'Level 3 Ask Volume',
-        'Level 4 Bid Price',
-        'Level 4 Bid Volume',
-        'Level 4 Ask Price', 
-        'Level 4 Ask Volume',
-        'Level 5 Bid Price',
-        'Level 5 Bid Volume',
-        'Level 5 Ask Price', 
-        'Level 5 Ask Volume',
-        'midPrice'
+        'Level 1 Bid Price','Level 1 Bid Volume','Level 1 Ask Price','Level 1 Ask Volume',
+        'Level 2 Bid Price','Level 2 Bid Volume','Level 2 Ask Price','Level 2 Ask Volume',
+        'Level 3 Bid Price','Level 3 Bid Volume','Level 3 Ask Price','Level 3 Ask Volume',
+        'Level 4 Bid Price','Level 4 Bid Volume','Level 4 Ask Price','Level 4 Ask Volume',
+        'Level 5 Bid Price','Level 5 Bid Volume','Level 5 Ask Price','Level 5 Ask Volume'
     ]
+    feature_columns = raw_cols + engineered_cols + ['midPrice']
+
+    """
+    Feature Engineering
+    -------------------
+    Added features:
+
+    - Time data: Time of day
+    - Volatility Measure
+    - Momentum of mid price
+    - Short term moving avg of mid price
+    - Microprice
+    - Order Flow Imbalance
+    - Order Book Imbalance
+    - Liquidity
+    """
+
+    # TODO: Implement above features
     
     target_column = 'midPrice'
     
@@ -211,8 +277,6 @@ def main():
     
     SEQ_LEN = 300
     X_train, y_train, X_val, y_val, X_test, y_test, scaler = preprocess(feature_data, SEQ_LEN, train_split=0.5, val_split=0.1)
-
-    print("1")
         
     DROPOUT = 0.2
     WINDOW_SIZE = SEQ_LEN - 10
@@ -271,7 +335,7 @@ def main():
         history = model.fit(
             X_train,
             y_train,
-            epochs=1,
+            epochs=350,
             batch_size=BATCH_SIZE,
             shuffle=False, 
             validation_data=(X_val, y_val),
