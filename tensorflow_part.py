@@ -8,7 +8,7 @@ from tensorflow.keras.optimizers import Adam
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.layers import Dropout, Activation, Dense, LSTM
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard, EarlyStopping
 import pickle
 
 def mean_absolute_percentage_error(y_true, y_pred):
@@ -25,46 +25,62 @@ def mean_absolute_percentage_error(y_true, y_pred):
     
     return tf.reduce_mean(percentage_errors_clipped)
 
-def to_sequences(data, seq_len):
+def preprocess(data_raw, seq_len, train_split, val_split, scaler=None, fit=True):
     """
-    Converts a 2D array into sequences of a specified length.
-    Each sequence will have `seq_len` time steps.
-    """
-    d = []
-    for index in range(len(data) - seq_len):
-        d.append(data[index: index + seq_len])
-    return np.array(d)
+    Creates sequences, splits into train/val/test, and scales.
+    Scaling is FIT ONLY on X_train, then applied to X_val, X_test, and y_*.
 
-def preprocess(data_raw, seq_len, train_split, val_split):
-    """
-    Preprocesses the raw data into sequences and splits it into
-    training, validation, and testing sets.
-    
     Args:
-        data_raw (np.array): The raw input data.
-        seq_len (int): The length of each sequence.
-        train_split (float): The proportion of data to use for training.
-        val_split (float): The proportion of data to use for validation.
-        
+        data_raw (np.array): Raw feature array [num_rows, num_features], unscaled.
+        seq_len (int): Total sequence length window used to build (X,y).
+        train_split (float): Proportion of sequences used for training.
+        val_split (float): Proportion of sequences used for validation.
+        scaler (MinMaxScaler | None): Provide to reuse; if None and fit=True, a new scaler is created.
+        fit (bool): If True, fit scaler on X_train only. If False, just transform with provided scaler.
+
     Returns:
-        tuple: X_train, y_train, X_val, y_val, X_test, y_test
+        tuple: (X_train, y_train, X_val, y_val, X_test, y_test, scaler)
     """
+    def to_sequences(data, seq_len):
+        d = []
+        for i in range(len(data) - seq_len):
+            d.append(data[i: i + seq_len])
+        return np.array(d)
+
+    # Build sequences on raw (unscaled) data
     data = to_sequences(data_raw, seq_len)
     num_train = int(train_split * data.shape[0])
     num_val = int(val_split * data.shape[0])
 
-    # X will be sequences of length (SEQ_LEN - 10)
-    # y will be the 10th step after the X sequence ends
+    # X: first (seq_len - 10) steps, y: the step at -10
     X_train = data[:num_train, :-10, :]
     y_train = data[:num_train, -10, :]
 
-    X_val = data[num_train:num_train + num_val, :-10, :]
-    y_val = data[num_train:num_train + num_val, -10, :]
+    X_val   = data[num_train:num_train + num_val, :-10, :]
+    y_val   = data[num_train:num_train + num_val, -10, :]
 
-    X_test = data[num_train + num_val:, :-10, :]
-    y_test = data[num_train + num_val:, :-10, :]
+    X_test  = data[num_train + num_val:, :-10, :]
+    y_test  = data[num_train + num_val:, -10, :]  # fixed vs. original
 
-    return X_train, y_train, X_val, y_val, X_test, y_test
+    # Fit-on-train-only scaling
+    n_features = X_train.shape[-1]
+    if scaler is None:
+        scaler = MinMaxScaler()
+
+    if fit:
+        scaler.fit(X_train.reshape(-1, n_features))
+
+    # Transform X sets
+    X_train = scaler.transform(X_train.reshape(-1, n_features)).reshape(X_train.shape)
+    X_val   = scaler.transform(X_val.reshape(-1, n_features)).reshape(X_val.shape)
+    X_test  = scaler.transform(X_test.reshape(-1, n_features)).reshape(X_test.shape)
+
+    # Transform y sets (shape [n_samples, n_features])
+    y_train = scaler.transform(y_train)
+    y_val   = scaler.transform(y_val)
+    y_test  = scaler.transform(y_test)
+
+    return X_train, y_train, X_val, y_val, X_test, y_test, scaler
 
 def numpy_mape(y_true, y_pred):
     y_true, y_pred = np.array(y_true), np.array(y_pred)
@@ -87,6 +103,11 @@ def numpy_mape(y_true, y_pred):
     print(f"MAPE Debug - Number of clipped values: {np.sum(percentage_errors > max_percentage)}")
     
     return np.mean(percentage_errors_clipped)
+
+def midprice_mse(y_true, y_pred):
+    y_true_mid = y_true[..., -1]
+    y_pred_mid = y_pred[..., -1]
+    return tf.reduce_mean(tf.square(y_true_mid - y_pred_mid))
 
 def main():
     RANDOM_SEED = 42
@@ -112,6 +133,19 @@ def main():
         device_name = "/device:CPU:0"
         
     print(f"Using device: {device_name}")  
+
+    experiment_name = 'short_improvements_pat20'
+    print("Starting experiment: " + experiment_name)
+
+    exp_root = os.path.join("experiments", experiment_name)
+    logs_dir = os.path.join("logs", experiment_name)
+    graphs_dir = os.path.join(exp_root, "graphs")
+    ckpt_path = os.path.join(exp_root, "model.h5")
+    results_pkl = os.path.join(exp_root, "tensorflow_results.pkl")
+
+    os.makedirs(exp_root, exist_ok=True)
+    os.makedirs(logs_dir, exist_ok=True)
+    os.makedirs(graphs_dir, exist_ok=True)
  
     data_dir = "data"
     csv_files = sorted([f for f in os.listdir(data_dir) if f.endswith('.csv')])
@@ -175,15 +209,14 @@ def main():
         print("Warning: NaN values found in feature data. Forward-filling them.")
         feature_data = pd.DataFrame(feature_data, columns=feature_columns).fillna(method='ffill').values
     
-    scaler = MinMaxScaler()
-    scaled_features = scaler.fit_transform(feature_data)
-    
     SEQ_LEN = 300
-    X_train, y_train, X_val, y_val, X_test, y_test = preprocess(scaled_features, SEQ_LEN, train_split = 0.5, val_split = 0.1)
-    
+    X_train, y_train, X_val, y_val, X_test, y_test, scaler = preprocess(feature_data, SEQ_LEN, train_split=0.5, val_split=0.1)
+
+    print("1")
+        
     DROPOUT = 0.2
     WINDOW_SIZE = SEQ_LEN - 10
-    N_FEATURES = scaled_features.shape[1]
+    N_FEATURES = X_train.shape[-1]
 
     model = keras.Sequential()
     model.add(LSTM(WINDOW_SIZE, return_sequences=True, input_shape=(WINDOW_SIZE, N_FEATURES)))
@@ -199,12 +232,11 @@ def main():
         monitor='val_loss', 
         factor=0.5, 
         patience=3, 
-        min_lr=1e-3
+        min_lr=1e-6
     )
     
-    checkpoint_filepath = 'best_model.h5'
     model_checkpoint_callback = ModelCheckpoint(
-        filepath=checkpoint_filepath,
+        filepath=ckpt_path,
         monitor='val_loss',
         mode='min',
         save_best_only=True,
@@ -212,8 +244,25 @@ def main():
         verbose=1
     )
 
+    early_stopping_callback = EarlyStopping(
+        monitor="val_loss",
+        min_delta=1e-4,
+        patience=20,
+        verbose=1,
+        restore_best_weights=True,
+    )
+
+    tb_callback = TensorBoard(
+        log_dir=logs_dir,
+        histogram_freq=0,
+        write_graph=True,
+        write_images=False,
+        update_freq='epoch',
+        profile_batch=0         
+    )
+
     adam = Adam(learning_rate=1e-4)
-    model.compile(loss='mean_squared_error', optimizer=adam, metrics=[mean_absolute_percentage_error])
+    model.compile(loss=midprice_mse, optimizer=adam, metrics=[mean_absolute_percentage_error])
     
     BATCH_SIZE = 300
 
@@ -222,11 +271,11 @@ def main():
         history = model.fit(
             X_train,
             y_train,
-            epochs=350,
+            epochs=1,
             batch_size=BATCH_SIZE,
             shuffle=False, 
             validation_data=(X_val, y_val),
-            callbacks=[lr_scheduler, model_checkpoint_callback]
+            callbacks=[lr_scheduler, model_checkpoint_callback, tb_callback, early_stopping_callback]
         )
         print("Model training finished.")
     except Exception as e:
@@ -240,12 +289,14 @@ def main():
             }
         })()
     
-    if os.path.exists(checkpoint_filepath):
-        print(f"\nLoading best model from {checkpoint_filepath} for evaluation.")
-        best_model = keras.models.load_model(checkpoint_filepath, 
-                                            custom_objects={'mean_absolute_percentage_error': mean_absolute_percentage_error})
+    if os.path.exists(ckpt_path):
+        print(f"\nLoading best model from {ckpt_path} for evaluation.")
+        best_model = keras.models.load_model(ckpt_path, 
+                                            custom_objects={'mean_absolute_percentage_error': mean_absolute_percentage_error,
+                                            'midprice_mse': midprice_mse               
+                                            })
     else:
-        print(f"\nError: Best model not found at {checkpoint_filepath}. Using the last trained model.")
+        print(f"\nError: Best model not found at {ckpt_path}. Using the last trained model.")
         best_model = model 
 
     print("\nEvaluating model on test data...")
@@ -262,7 +313,7 @@ def main():
         plt.xlabel('Epoch')
         plt.legend(loc='upper right')
         plt.grid(True, alpha=0.3)
-        plt.savefig('graphs/training_loss.png')
+        plt.savefig(os.path.join(graphs_dir, 'training_loss.png'))
         plt.show()
     except Exception as e:
         print(f"Warning: Could not create training loss plot: {e}")
@@ -288,7 +339,7 @@ def main():
         plt.ylabel('Price')
         plt.legend(loc='best')
         plt.grid(True, alpha=0.3)
-        plt.savefig('graphs/prediction_comparison.png')
+        plt.savefig(os.path.join(graphs_dir, 'prediction_comparison.png'))
         plt.show()
     except Exception as e:
         print(f"Warning: Could not create prediction comparison plot: {e}")
@@ -336,9 +387,9 @@ def main():
     }
     
     # Save results to file
-    with open('tensorflow_results.pkl', 'wb') as f:
+    with open(results_pkl, 'wb') as f:
         pickle.dump(results, f)
-    
+     
     print("\nTensorFlow results saved to 'tensorflow_results.pkl'")
     print("TensorFlow part completed successfully!")
 

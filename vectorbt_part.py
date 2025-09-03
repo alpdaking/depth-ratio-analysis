@@ -127,7 +127,7 @@ def print_performance_report(stats: Dict, decisions: pd.DataFrame):
         print("="*60)
 
 
-def run_backtest(df, decisions, strategy_name):
+def run_backtest(df, decisions, strategy_name, graphs_dir):
     print(f"\n=== VectorBT Backtest for {strategy_name.upper()} Strategy ===")
     
     try:
@@ -178,7 +178,7 @@ def run_backtest(df, decisions, strategy_name):
         print(f"Profit Factor:                      {full_stats['Profit Factor']:.3f}")
         print(f"Calmar Ratio:                       {full_stats['Calmar Ratio']:.3f}")
         
-        create_backtest_plots(pf, strategy_name)
+        create_backtest_plots(pf, strategy_name, graphs_dir)
         
         return {
             'portfolio': pf,
@@ -224,7 +224,7 @@ def run_backtest(df, decisions, strategy_name):
             raise e2
         """
 
-def create_backtest_plots(pf, strategy_name):
+def create_backtest_plots(pf, strategy_name, graphs_dir):
     os.makedirs('graphs', exist_ok=True)
     
     try:
@@ -232,7 +232,7 @@ def create_backtest_plots(pf, strategy_name):
         pf.value().plot()
         plt.title(f'Portfolio Value - {strategy_name.upper()} Strategy')
         plt.grid(True, alpha=0.3)
-        plt.savefig(f'graphs/portfolio_value_{strategy_name}.png', dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(graphs_dir, f'portfolio_value_{strategy_name}.png'), dpi=300, bbox_inches='tight')
         plt.show()
         
         plt.figure(figsize=(12, 6))
@@ -240,7 +240,7 @@ def create_backtest_plots(pf, strategy_name):
         returns.hist(bins=50)
         plt.title(f'Returns Distribution - {strategy_name.upper()} Strategy')
         plt.grid(True, alpha=0.3)
-        plt.savefig(f'graphs/returns_distribution_{strategy_name}.png', dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(graphs_dir, f'returns_distribution_{strategy_name}.png'), dpi=300, bbox_inches='tight')
         plt.show()
 
         """plt.figure(figsize=(12, 6))
@@ -270,7 +270,7 @@ def create_backtest_plots(pf, strategy_name):
         print(f"Warning: Error creating plots for {strategy_name}: {e}")
         print("Continuing with backtest analysis...")
     
-def compare_strategies(backtest_results):
+def compare_strategies(backtest_results, graphs_dir):
     print("\n=== Strategy Comparison ===")
     
     comparison_data = []
@@ -289,11 +289,11 @@ def compare_strategies(backtest_results):
     comparison_df = pd.DataFrame(comparison_data)
     print(comparison_df.to_string(index=False, float_format='%.3f'))
     
-    create_comparison_plots(backtest_results)
+    create_comparison_plots(backtest_results, graphs_dir)
     
     return comparison_df
 
-def create_comparison_plots(backtest_results):
+def create_comparison_plots(backtest_results, graphs_dir):
     try:
         plt.figure(figsize=(15, 8))
         for strategy, results in backtest_results.items():
@@ -305,7 +305,7 @@ def create_comparison_plots(backtest_results):
         plt.ylabel('Portfolio Value')
         plt.legend()
         plt.grid(True, alpha=0.3)
-        plt.savefig('graphs/strategy_comparison_portfolio.png', dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(graphs_dir, 'strategy_comparison_portfolio.png'), dpi=300, bbox_inches='tight')
         plt.show()
         
         plt.figure(figsize=(15, 8))
@@ -319,7 +319,7 @@ def create_comparison_plots(backtest_results):
         plt.ylabel('Returns')
         plt.legend()
         plt.grid(True, alpha=0.3)
-        plt.savefig('graphs/strategy_comparison_returns.png', dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(graphs_dir, 'strategy_comparison_returns.png'), dpi=300, bbox_inches='tight')
         plt.show()
         
         plt.figure(figsize=(10, 8))
@@ -337,14 +337,14 @@ def create_comparison_plots(backtest_results):
         plt.title('Risk-Return Profile - All Strategies')
         plt.legend()
         plt.grid(True, alpha=0.3)
-        plt.savefig('graphs/risk_return_comparison.png', dpi=300, bbox_inches='tight')
+        plt.savefig(os.path.join(graphs_dir, 'risk_return_comparison.png'), dpi=300, bbox_inches='tight')
         plt.show()
         
     except Exception as e:
         print(f"Warning: Error creating comparison plots: {e}")
         print("Continuing with analysis...")
 
-def save_final_results(backtest_results, comparison_df):
+def save_final_results(backtest_results, comparison_df, exp_root):
     serializable_results = {}
     for strategy_name, results in backtest_results.items():
         serializable_results[strategy_name] = {
@@ -358,10 +358,10 @@ def save_final_results(backtest_results, comparison_df):
         'timestamp': pd.Timestamp.now()
     }
     
-    with open('vectorbt_final_results.pkl', 'wb') as f:
+    with open(os.path.join(exp_root, 'vectorbt_final_results.pkl'), 'wb') as f:
         pickle.dump(final_results, f)
     
-    comparison_df.to_csv('strategy_comparison.csv', index=False)
+    comparison_df.to_csv(os.path.join(exp_root, 'strategy_comparison.csv'), index=False)
     
     print("\nFinal results saved to 'vectorbt_final_results.pkl'")
     print("Strategy comparison saved to 'strategy_comparison.csv'")
@@ -369,9 +369,14 @@ def save_final_results(backtest_results, comparison_df):
 
 def main():
     print("=== VectorBT Backtesting Part ===")
-    
+
+    experiment_name = "short_improvements_pat20"
+    exp_root = os.path.join("experiments", experiment_name)
+    trading_pkl = os.path.join(exp_root, 'trading_results.pkl')
+    graphs_dir = os.path.join(exp_root, "graphs")
+
     try:
-        with open('trading_results.pkl', 'rb') as f:
+        with open(trading_pkl, 'rb') as f:
             trading_results = pickle.load(f)
         print("Successfully loaded trading decision results")
     except FileNotFoundError:
@@ -399,7 +404,7 @@ def main():
         print(f"{'='*50}")
         
         try:
-            results = run_backtest(df, decisions, strategy_name)
+            results = run_backtest(df, decisions, strategy_name, graphs_dir)
             backtest_results[strategy_name] = results
             print(f"Backtest completed successfully for {strategy_name}")
         except Exception as e:
@@ -411,9 +416,9 @@ def main():
         print("No successful backtests completed. Exiting.")
         return
     
-    comparison_df = compare_strategies(backtest_results)
+    comparison_df = compare_strategies(backtest_results, graphs_dir)
     
-    save_final_results(backtest_results, comparison_df)
+    save_final_results(backtest_results, comparison_df, exp_root)
     
     print("\n" + "="*60)
     print("VECTORBT BACKTESTING COMPLETED SUCCESSFULLY!")

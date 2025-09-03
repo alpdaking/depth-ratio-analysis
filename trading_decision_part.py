@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import pickle
 import matplotlib.pyplot as plt
+import os
 
 """
 Trading Decision Part - Enhanced with Reduced Trading Frequency Options
@@ -475,7 +476,7 @@ def adjust_volatility_breakout_trading_frequency(
     
     return VOLATILITY_BREAKOUT_CONFIG
 
-def analyze_decisions(decisions, price_data, strategy_type):
+def analyze_decisions(decisions, price_data, strategy_type, graphs_dir):
     print(f"\n=== Trading Decision Analysis for {strategy_type.upper()} Strategy ===")
     
     buy_count = (decisions == 1).sum()
@@ -519,7 +520,7 @@ def analyze_decisions(decisions, price_data, strategy_type):
         plt.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig(f'graphs/trading_decisions_{strategy_type}.png')
+        plt.savefig(os.path.join(graphs_dir, f'trading_decisions_{strategy_type}.png'))
         plt.show()
     except Exception as e:
         print(f"Warning: Could not create trading decisions plot for {strategy_type}: {e}")
@@ -534,6 +535,13 @@ def analyze_decisions(decisions, price_data, strategy_type):
     }
 
 def main():
+    experiment_name = "short_improvements_pat20"
+
+    exp_root = os.path.join("experiments", experiment_name)
+    results_pkl = os.path.join(exp_root, "tensorflow_results.pkl")
+    trading_pkl = os.path.join(exp_root, 'trading_results.pkl')
+    graphs_dir = os.path.join(exp_root, "graphs")
+
     print("=== Trading Decision Part ===")
     
     print("\n--- Adjusting All Strategy Parameters ---")
@@ -585,7 +593,7 @@ def main():
     adjust_volatility_breakout_trading_frequency()
     
     try:
-        with open('tensorflow_results.pkl', 'rb') as f:
+        with open(results_pkl, 'rb') as f:
             tensorflow_results = pickle.load(f)
         print("Successfully loaded TensorFlow results")
     except FileNotFoundError:
@@ -621,7 +629,7 @@ def main():
                 start_index
             )
             
-            analysis_results = analyze_decisions(decisions, df, strategy_type)
+            analysis_results = analyze_decisions(decisions, df, strategy_type, graphs_dir)
             all_results[strategy_type] = {
                 'decisions': decisions,
                 'analysis': analysis_results
@@ -645,7 +653,7 @@ def main():
         'SEQ_LEN': SEQ_LEN
     }
     
-    with open('trading_results.pkl', 'wb') as f:
+    with open(trading_pkl, 'wb') as f:
         pickle.dump(trading_results, f)
     
     print("\nTrading decisions saved to 'trading_results.pkl'")
