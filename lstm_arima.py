@@ -10,6 +10,12 @@ from tensorflow.keras.layers import Dropout, Activation, Dense, LSTM
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard, EarlyStopping
 import pickle
+import warnings
+
+# NEW: SARIMAX
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+
+warnings.filterwarnings("ignore")
 
 def mean_absolute_percentage_error(y_true, y_pred):
     y_true = tf.cast(y_true, tf.float32)
@@ -109,6 +115,65 @@ def midprice_mse(y_true, y_pred):
     y_pred_mid = y_pred[..., -1]
     return tf.reduce_mean(tf.square(y_true_mid - y_pred_mid))
 
+# ===== NEW: ARIMA helpers =====
+def select_arima_order(series, p_values=range(0, 4), d_values=range(0, 3), q_values=range(0, 4), max_points=None):
+    """Grid-search SARIMAX(p,d,q) by AIC on a 1D series (non-seasonal)."""
+    y = np.asarray(series, dtype=float)
+    if max_points is not None and len(y) > max_points:
+        y = y[-max_points:]  # speed-up
+
+    best_order, best_aic = None, np.inf
+    for p in p_values:
+        for d in d_values:
+            for q in q_values:
+                if p == d == q == 0:
+                    continue
+                try:
+                    mod = SARIMAX(
+                        y,
+                        order=(p, d, q),
+                        seasonal_order=(0, 0, 0, 0),
+                        enforce_stationarity=False,
+                        enforce_invertibility=False
+                    )
+                    res = mod.fit(disp=False, maxiter=200)
+                    aic = res.aic
+                    if np.isfinite(aic) and aic < best_aic:
+                        best_aic, best_order = aic, (p, d, q)
+                except Exception:
+                    continue
+
+    if best_order is None:
+        best_order, best_aic = (1, 1, 0), np.nan
+    print(f"Selected SARIMAX order by AIC: {best_order} (AIC={best_aic:.2f})")
+    return best_order
+def walkforward_arima_forecasts(series, order, start_index):
+    n = len(series)
+    forecasts = np.full(n, np.nan, dtype=float)
+
+    fit_end = max(start_index, order[1] + 5)  # ensure some minimum length
+    mod_init = SARIMAX(
+        series[:fit_end],
+        order=order,
+        enforce_stationarity=False,
+        enforce_invertibility=False
+    )
+    res_init = mod_init.fit(disp=False, maxiter=200)
+
+    mod_full = SARIMAX(
+        series,
+        order=order,
+        enforce_stationarity=False,
+        enforce_invertibility=False
+    )
+    res_full = mod_full.filter(res_init.params)
+
+    pred = res_full.get_prediction(start=start_index, end=n-1, dynamic=False)
+    forecasts[start_index:] = np.asarray(pred.predicted_mean)
+
+    return forecasts
+
+
 def main():
     RANDOM_SEED = 42
     np.random.seed(RANDOM_SEED)
@@ -134,7 +199,7 @@ def main():
         
     print(f"Using device: {device_name}")  
 
-    experiment_name = 'no_earlystop_100epochs'
+    experiment_name = 'sarimaxlstm'
     print("Starting experiment: " + experiment_name)
 
     exp_root = os.path.join("experiments", experiment_name)
@@ -210,7 +275,41 @@ def main():
         feature_data = pd.DataFrame(feature_data, columns=feature_columns).fillna(method='ffill').values
     
     SEQ_LEN = 300
-    X_train, y_train, X_val, y_val, X_test, y_test, scaler = preprocess(feature_data, SEQ_LEN, train_split=0.5, val_split=0.1)
+
+    N_seq = len(feature_data) - SEQ_LEN
+    num_train = int(0.5 * N_seq)
+    num_val = int(0.1 * N_seq)
+
+    target_offset = SEQ_LEN - 10
+    target_indices_all = np.arange(N_seq) + target_offset
+    train_k = np.arange(0, num_train)
+    val_k   = np.arange(num_train, num_train + num_val)
+    test_k  = np.arange(num_train + num_val, N_seq)
+
+    train_t_idx = train_k + target_offset
+    val_t_idx   = val_k + target_offset
+    test_t_idx  = test_k + target_offset
+
+    mid = df['midPrice'].values.astype(float)
+
+    # 1) ARIMA order selection on training *targets* only (no leakage)
+    arima_train_end = int(train_t_idx[-1])
+    arima_series_for_order = mid[:arima_train_end]
+    best_order = select_arima_order(arima_series_for_order, range(0,4), range(0,3), range(0,4))
+
+    # 2) Walk-forward ARIMA forecasts for the entire series (1-step ahead)
+    walk_start = int(target_indices_all[0])
+    arima_forecasts = walkforward_arima_forecasts(mid, best_order, walk_start)
+
+    # Residuals at target times
+    residuals = np.full_like(mid, np.nan, dtype=float)
+    valid_mask = ~np.isnan(arima_forecasts)
+    residuals[valid_mask] = mid[valid_mask] - arima_forecasts[valid_mask]
+
+    # Keep original midPrice in features; we'll swap the target column to its residual
+    X_train, y_train, X_val, y_val, X_test, y_test, scaler = preprocess(
+        feature_data, SEQ_LEN, train_split=0.5, val_split=0.1
+    )
 
     print("1")
         
@@ -258,12 +357,30 @@ def main():
     
     BATCH_SIZE = 300
 
-    print("\nStarting model training...")
+    last_col_idx = feature_columns.index('midPrice')
+
+    def swap_y_to_residuals(y_scaled, target_abs_indices):
+        """
+        Replace the last column of y (currently scaled midPrice) with scaled residuals
+        for the corresponding absolute target timestamps.
+        """
+        y_inv = scaler.inverse_transform(y_scaled)
+        y_inv[:, last_col_idx] = residuals[target_abs_indices]
+        nan_mask = np.isnan(y_inv[:, last_col_idx])
+        if np.any(nan_mask):
+            y_inv[nan_mask, last_col_idx] = 0.0
+        return scaler.transform(y_inv)
+
+    y_train = swap_y_to_residuals(y_train, train_t_idx)
+    y_val   = swap_y_to_residuals(y_val,   val_t_idx)
+    y_test  = swap_y_to_residuals(y_test,  test_t_idx)
+
+    print("\nStarting model training on residuals...")
     try:
         history = model.fit(
             X_train,
             y_train,
-            epochs=100,
+            epochs=350,
             batch_size=BATCH_SIZE,
             shuffle=False, 
             validation_data=(X_val, y_val),
@@ -273,7 +390,6 @@ def main():
     except Exception as e:
         print(f"Error during model training: {e}")
         print("Attempting to continue with existing model...")
-        # Create a dummy history object
         history = type('obj', (object,), {
             'history': {
                 'loss': [0.1],
@@ -291,16 +407,16 @@ def main():
         print(f"\nError: Best model not found at {ckpt_path}. Using the last trained model.")
         best_model = model 
 
-    print("\nEvaluating model on test data...")
+    print("\nEvaluating model on test data (residual targets)...")
     test_loss, test_mape = best_model.evaluate(X_test, y_test, verbose=0)
-    print(f"Test Loss (best model): {test_loss:.6f}")
-    print(f"Test MAPE (best model): {test_mape:.2f}%")
+    print(f"Test Loss (best model) [residual MSE]: {test_loss:.6f}")
+    print(f"Test MAPE (best model) [on residual scale]: {test_mape:.2f}%")
     
     try:
         plt.figure(figsize=(12, 4))
         plt.plot(history.history['loss'], label='Train Loss')
         plt.plot(history.history['val_loss'], label='Validation Loss')
-        plt.title('Model Loss Over Epochs')
+        plt.title('Residual Model Loss Over Epochs')
         plt.ylabel('Loss')
         plt.xlabel('Epoch')
         plt.legend(loc='upper right')
@@ -314,20 +430,28 @@ def main():
     print("\nMaking predictions on test data...")
     y_hat = best_model.predict(X_test)
 
+    # Inverse-transform to original scale (now these are residual predictions in the last column)
     y_test_inverse = scaler.inverse_transform(y_test)
-    y_hat_inverse = scaler.inverse_transform(y_hat)
+    y_hat_inverse  = scaler.inverse_transform(y_hat)
     
-    last_col_idx = feature_columns.index('midPrice') 
-    y_test_last = y_test_inverse[:, last_col_idx]
-    y_hat_last = y_hat_inverse[:, last_col_idx]
+    # Extract residuals (last column) and reconstruct final midPrice predictions
+    resid_test = y_test_inverse[:, last_col_idx]
+    resid_hat  = y_hat_inverse[:, last_col_idx]
 
+    # ARIMA 1-step forecasts for the *same* test target timestamps
+    arima_test_fc = arima_forecasts[test_t_idx]
+
+    # Hybrid predictions & ground truth (original midPrice)
+    y_test_last = df['midPrice'].values[test_t_idx]             # actual price
+    y_hat_last  = arima_test_fc + resid_hat                     # hybrid prediction
+
+    # Plots/metrics on original price scale
     try:
         plt.figure(figsize=(12, 6))
         plt.plot(y_test_last, label="Actual Mid Price", color='green', alpha=0.7)
-        plt.plot(y_hat_last, label="Predicted Mid Price", color='red', alpha=0.7)
-
-        plt.title('Mid Price Prediction - Multivariate LSTM')
-        plt.xlabel('Time Steps')
+        plt.plot(y_hat_last, label="Hybrid Pred (ARIMA + LSTM residual)", color='red', alpha=0.7)
+        plt.title('Mid Price Prediction - ARIMA + Residual LSTM (Walk-Forward ARIMA)')
+        plt.xlabel('Test Samples (time-ordered)')
         plt.ylabel('Price')
         plt.legend(loc='best')
         plt.grid(True, alpha=0.3)
@@ -342,7 +466,7 @@ def main():
     rmse = np.sqrt(mse)
     mape = numpy_mape(y_test_last, y_hat_last)
 
-    print(f"\nPrediction Metrics (on inverse transformed 'midPrice'):")
+    print(f"\nPrediction Metrics (on original 'midPrice' via hybrid):")
     print(f"MSE: {mse:.6f}")
     print(f"MAE: {mae:.6f}")
     print(f"RMSE: {rmse:.6f}")
@@ -351,9 +475,6 @@ def main():
     print(f"\nFeature columns used for training: {feature_columns}")
     print(f"Number of features: {N_FEATURES}")
 
-    # Calculate start index for trading decisions
-    # With new split: train 50%, validation 10%, test 40%
-    # start_index = SEQ_LEN + train_size + val_size
     train_size = int(0.5 * (len(df) - SEQ_LEN))
     val_size = int(0.1 * (len(df) - SEQ_LEN))
     start_index = SEQ_LEN + train_size + val_size
@@ -361,7 +482,6 @@ def main():
     print(f"Data split - Train: 50%, Validation: 10%, Test: 40%")
     print(f"Start index for trading decisions: {start_index}")
 
-    # Save results for the next step
     results = {
         'df': df,
         'y_hat_last': y_hat_last,
@@ -375,6 +495,20 @@ def main():
             'mae': mae,
             'rmse': rmse,
             'mape': mape
+        },
+        # Extras to inspect later:
+        'arima': {
+            'order': best_order,
+            'forecasts_test': arima_test_fc,
+        },
+        'residuals': {
+            'test_true_resid': resid_test,
+            'test_pred_resid': resid_hat
+        },
+        'indices': {
+            'train_t_idx': train_t_idx,
+            'val_t_idx': val_t_idx,
+            'test_t_idx': test_t_idx
         }
     }
     
